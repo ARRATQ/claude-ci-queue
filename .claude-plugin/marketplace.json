@@ -1,0 +1,14 @@
+{
+  "name": "claude-ci-queue",
+  "description": "A Claude Code mod that shows your GitHub Actions runs, queue and progress in a side pane.",
+  "owner": {
+    "name": "ARRATQ"
+  },
+  "plugins": [
+    {
+      "name": "ci-queue",
+      "source": "./",
+      "description": "A side pane showing your GitHub Actions runs: what is running (with % done and time left), the queue (with estimated start times), and a notification when a run finishes."
+    }
+  ]
+}
