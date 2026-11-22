@@ -6,7 +6,7 @@ A side pane in Claude Code that keeps an eye on your GitHub Actions runs while y
 - **Queue** — waiting runs in order, how long they have waited and an **estimated start time**.
 - **Recently finished** — a toast (and a system notification where your terminal supports it) when a run ends: `CI failed ✗ (Backend tests) — #41 · ABC-123`.
 
-The status line shows `CI: 1 running · 6 queued`. The pane refreshes every 30 seconds.
+The status line shows `CI: 1 running · 6 queued`. The pane refreshes every minute while it is shown and every 5 minutes while it is hidden. Every Claude Code session on the machine shares one cache of GitHub answers (in `/tmp/claude-ci-queue`), so many open sessions use about as much GitHub API quota as one.
 
 ## Install
 

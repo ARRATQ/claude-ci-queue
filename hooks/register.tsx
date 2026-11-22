@@ -5,7 +5,14 @@ import type { CiSnapshot, FinishedView, JobView, RunView } from '../types'
 
 const PANE = 'ci-queue'
 const TITLE = 'CI queue'
-const REFRESH_MS = 30_000
+// One pass a minute while the pane is shown, every 5 minutes while it is hidden.
+const REFRESH_MS = 60_000
+const HIDDEN_REFRESH_MS = 5 * 60_000
+// gh answers are shared on disk by every session on this machine, so ten open
+// sessions cost about as much GitHub API quota as one.
+const CACHE_DIR = '/tmp/claude-ci-queue'
+const LIVE_TTL_MS = 50_000
+const DONE_TTL_MS = 24 * 60 * 60_000
 const HISTORY_MS = 60 * 60_000
 // A run "in progress" for longer than this is a ghost (killed runner, run never closed).
 const GHOST_AGE_MS = 12 * 60 * 60_000
@@ -56,6 +63,7 @@ let mediansAt = 0
 let mediansRepo = ''
 let timer: { cancel: () => void } | null = null
 let inflight: Promise<void> | null = null
+let lastPassAt = 0
 let ghPath: string | null = null
 let repo: string | null = null
 let configuredRepo = ''
@@ -81,6 +89,22 @@ async function gh($: EngineInterface, args: string[]): Promise<string> {
   throw new Error('GitHub CLI (gh) not found: install it and run `gh auth login`')
 }
 
+// gh through the shared disk cache: an answer younger than ttlMs, written by
+// any session, is reused instead of calling GitHub again.
+async function cachedGh($: EngineInterface, args: string[], ttlMs: number): Promise<string> {
+  const key = args.join(' ').replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 180)
+  const file = `${CACHE_DIR}/${key}.json`
+  try {
+    const hit = JSON.parse(await $.fs.read(file)) as { at: number; out: string }
+    if (Date.now() - hit.at < ttlMs) return hit.out
+  } catch {
+    // no cache yet, or unreadable: ask GitHub
+  }
+  const out = await gh($, args)
+  await $.fs.write(file, JSON.stringify({ at: Date.now(), out })).catch(() => undefined)
+  return out
+}
+
 async function resolveRepo($: EngineInterface): Promise<string> {
   if (configuredRepo) return configuredRepo
   if (repo) return repo
@@ -94,12 +118,13 @@ async function resolveRepo($: EngineInterface): Promise<string> {
 }
 
 async function listRuns($: EngineInterface, target: string, status: string): Promise<GhRun[]> {
-  const out = await gh($, ['run', 'list', '-R', target, '--status', status, '-L', '50', '--json', RUN_FIELDS])
+  const out = await cachedGh($, ['run', 'list', '-R', target, '--status', status, '-L', '50', '--json', RUN_FIELDS], LIVE_TTL_MS)
   return JSON.parse(out) as GhRun[]
 }
 
-async function listJobs($: EngineInterface, target: string, runId: number): Promise<GhJob[]> {
-  const out = await gh($, ['api', `repos/${target}/actions/runs/${runId}/jobs?per_page=100`])
+// A finished run's jobs never change: pass DONE_TTL_MS for those.
+async function listJobs($: EngineInterface, target: string, runId: number, ttlMs = LIVE_TTL_MS): Promise<GhJob[]> {
+  const out = await cachedGh($, ['api', `repos/${target}/actions/runs/${runId}/jobs?per_page=100`], ttlMs)
   return (JSON.parse(out).jobs ?? []) as GhJob[]
 }
 
@@ -114,10 +139,10 @@ async function refreshMedians($: EngineInterface, target: string, workflows: str
   if (now - mediansAt < HISTORY_MS && workflows.every(known)) return
   const samples: Record<string, number[]> = {}
   for (const wf of workflows) {
-    const out = await gh($, ['run', 'list', '-R', target, '--workflow', wf, '--status', 'success', '-L', '5', '--json', 'databaseId'])
+    const out = await cachedGh($, ['run', 'list', '-R', target, '--workflow', wf, '--status', 'success', '-L', '5', '--json', 'databaseId'], HISTORY_MS)
     const ids = (JSON.parse(out) as { databaseId: number }[]).map(r => r.databaseId)
     for (const id of ids) {
-      const jobs = await listJobs($, target, id)
+      const jobs = await listJobs($, target, id, DONE_TTL_MS)
       const ran = jobs.filter(j => j.conclusion !== 'skipped')
       const starts = ran.flatMap(j => (j.started_at ? [Date.parse(j.started_at)] : []))
       const ends = ran.flatMap(j => (j.completed_at ? [Date.parse(j.completed_at)] : []))
@@ -214,7 +239,9 @@ function estimateStarts(running: RunView[], queued: RunView[], now: number): Run
 async function checkFinished($: EngineInterface, target: string, gone: GhRun[], now: number): Promise<FinishedView[]> {
   const done: FinishedView[] = []
   for (const run of gone) {
-    const detail = JSON.parse(await gh($, ['api', `repos/${target}/actions/runs/${run.databaseId}`])) as GhRunDetail
+    const detail = JSON.parse(
+      await cachedGh($, ['api', `repos/${target}/actions/runs/${run.databaseId}`], LIVE_TTL_MS),
+    ) as GhRunDetail
     if (detail.status !== 'completed') {
       watched.set(run.databaseId, run) // now "waiting" or similar: keep watching it
       continue
@@ -223,7 +250,7 @@ async function checkFinished($: EngineInterface, target: string, gone: GhRun[], 
     const failedJobs =
       conclusion === 'success'
         ? []
-        : (await listJobs($, target, run.databaseId))
+        : (await listJobs($, target, run.databaseId, DONE_TTL_MS))
             .filter(j => j.conclusion === 'failure' || j.conclusion === 'timed_out')
             .map(j => j.name)
     done.push({
@@ -272,8 +299,17 @@ function refresh($: EngineInterface): Promise<void> {
   return inflight
 }
 
+// The timer's tick: a full pass while the pane is shown, a slower one otherwise.
+async function tick($: EngineInterface): Promise<void> {
+  const panes = await $.ui.panes().catch(() => [])
+  const shown = panes.some(p => p.id === PANE && p.isShown)
+  if (!shown && Date.now() - lastPassAt < HIDDEN_REFRESH_MS - 5_000) return
+  await refresh($)
+}
+
 async function pass($: EngineInterface): Promise<void> {
   let target: string | null = null
+  lastPassAt = Date.now()
   try {
     const now = Date.now()
     target = await resolveRepo($)
@@ -344,7 +380,7 @@ export const register: Register = (on, options) => {
     })
     void $.ui.open({ id: PANE, title: TITLE })
     timer?.cancel()
-    timer = $.clock.every(REFRESH_MS, () => void refresh($))
+    timer = $.clock.every(REFRESH_MS, () => void tick($))
     void refresh($)
     return next(e)
   })
@@ -443,7 +479,7 @@ export const register: Register = (on, options) => {
         ))}
 
         <Text dimColor>
-          {'\n'}updated {snap.updatedAt ? clock(snap.updatedAt) : '—'} · every 30 s
+          {'\n'}updated {snap.updatedAt ? clock(snap.updatedAt) : '—'} · every 1 min (5 min when hidden)
           {snap.ghosts > 0 ? ` · ${snap.ghosts} stale run(s) ignored` : ''}
         </Text>
       </Box>

@@ -20,6 +20,10 @@ function engine(on: any, state: { finished: boolean; repoFromFolder: boolean }, 
   on('ui.toast', (_: unknown, e: { text: string }) => { toasts.push(e.text); return { value: undefined } })
   on('ui.notify', () => ({ value: { isSent: true, channel: 'test' } }))
   on('clock.every', () => ({ value: undefined }))
+  // No shared disk cache in tests: every pass asks the (mocked) gh again.
+  on('fs.read', () => { throw new Error('ENOENT') })
+  on('fs.write', () => ({ value: undefined }))
+  on('ui.panes', () => ({ value: [] }))
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   on('process.run', (_: unknown, e: { argv: string[] }) => {
     const a = e.argv.join(' ')

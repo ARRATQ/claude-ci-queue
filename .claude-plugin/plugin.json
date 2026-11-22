@@ -1,6 +1,6 @@
 {
   "name": "ci-queue",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "A side pane showing your GitHub Actions runs: what is running (with % done and time left), the queue (with estimated start times), and a notification when a run finishes.",
   "author": { "name": "ARRATQ", "url": "https://github.com/ARRATQ" },
   "homepage": "https://github.com/ARRATQ/claude-ci-queue",
